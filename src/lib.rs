@@ -14,6 +14,7 @@ pub use self::server::*;
 mod client;
 /// cbindgen:ignore
 pub mod common;
+pub mod enterprise;
 #[cfg(not(any(target_os = "ios")))]
 pub mod ipc;
 mod lan;

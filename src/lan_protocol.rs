@@ -19,6 +19,11 @@ pub struct LanPeerIdentity {
     pub fingerprint: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanHandshakeMeta {
+    pub client_capabilities: u64,
+}
+
 fn require_protocol_version(remote: u32, role: &str) -> ResultType<()> {
     if remote != PROTOCOL_VERSION {
         bail!(
@@ -56,12 +61,19 @@ pub fn fingerprint(device_public_key: &[u8]) -> String {
 }
 
 pub async fn client_handshake(stream: &mut Stream) -> ResultType<LanPeerIdentity> {
+    client_handshake_with_capabilities(stream, 0).await
+}
+
+pub async fn client_handshake_with_capabilities(
+    stream: &mut Stream,
+    client_capabilities: u64,
+) -> ResultType<LanPeerIdentity> {
     let client_nonce = randombytes::randombytes(NONCE_LEN);
     let mut hello = Message::new();
     hello.set_lan_client_hello(LanClientHello {
         protocol_version: PROTOCOL_VERSION,
         client_nonce: Bytes::from(client_nonce.clone()),
-        client_capabilities: 0,
+        client_capabilities,
         ..Default::default()
     });
     timeout(CONNECT_TIMEOUT, stream.send(&hello)).await??;
@@ -112,7 +124,7 @@ pub async fn client_handshake(stream: &mut Stream) -> ResultType<LanPeerIdentity
     })
 }
 
-pub async fn server_handshake(stream: &mut Stream) -> ResultType<()> {
+pub async fn server_handshake(stream: &mut Stream) -> ResultType<LanHandshakeMeta> {
     let (secret_key, public_key) = Config::get_key_pair();
     if secret_key.len() != sign::SECRETKEYBYTES || public_key.len() != sign::PUBLICKEYBYTES {
         bail!("Handshake failed: invalid device identity key");
@@ -128,7 +140,7 @@ async fn server_handshake_with_identity(
     stream: &mut Stream,
     device_secret_key: &sign::SecretKey,
     device_public_key: &sign::PublicKey,
-) -> ResultType<()> {
+) -> ResultType<LanHandshakeMeta> {
     let bytes = timeout(READ_TIMEOUT, stream.next())
         .await?
         .ok_or_else(|| anyhow!("Handshake failed: client closed the connection"))??;
@@ -142,6 +154,7 @@ async fn server_handshake_with_identity(
     if client_hello.client_nonce.len() != NONCE_LEN {
         bail!("Handshake failed: invalid client nonce length");
     }
+    let client_capabilities = client_hello.client_capabilities;
 
     let (ephemeral_public_key, ephemeral_secret_key) = box_::gen_keypair();
     let server_nonce = randombytes::randombytes(NONCE_LEN);
@@ -178,7 +191,9 @@ async fn server_handshake_with_identity(
         &ephemeral_secret_key,
     )?;
     stream.set_key(key);
-    Ok(())
+    Ok(LanHandshakeMeta {
+        client_capabilities,
+    })
 }
 
 #[cfg(test)]
@@ -235,6 +250,48 @@ mod tests {
         assert!(require_protocol_version(PROTOCOL_VERSION + 1, "server").is_err());
     }
 
+    #[test]
+    fn enterprise_capability_bits_are_distinct() {
+        assert_ne!(
+            crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_V1,
+            crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_REQUESTED
+        );
+        assert_eq!(
+            crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_V1
+                & crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_REQUESTED,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_handshake_reports_client_capabilities() {
+        let _ = hbb_common::sodiumoxide::init();
+        let (device_public_key, device_secret_key) = sign::gen_keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capabilities = crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_V1
+            | crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_REQUESTED;
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let local_addr = socket.local_addr().unwrap();
+            let mut stream = Stream::from(socket, local_addr);
+            server_handshake_with_identity(&mut stream, &device_secret_key, &device_public_key)
+                .await
+                .unwrap()
+        });
+
+        let socket = TcpStream::connect(addr).await.unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let mut stream = Stream::from(socket, local_addr);
+        client_handshake_with_capabilities(&mut stream, capabilities)
+            .await
+            .unwrap();
+
+        let meta = server_task.await.unwrap();
+        assert_eq!(meta.client_capabilities & capabilities, capabilities);
+    }
+
     #[tokio::test]
     async fn loopback_handshake_encrypts_application_payload() {
         let _ = hbb_common::sodiumoxide::init();
@@ -250,9 +307,13 @@ mod tests {
             let (socket, _) = server_listener.accept().await.unwrap();
             let local_addr = socket.local_addr().unwrap();
             let mut stream = Stream::from(socket, local_addr);
-            server_handshake_with_identity(&mut stream, &device_secret_key, &device_public_key)
-                .await
-                .unwrap();
+            let meta = server_handshake_with_identity(
+                &mut stream,
+                &device_secret_key,
+                &device_public_key,
+            )
+            .await
+            .unwrap();
             assert!(stream.is_secured());
             let bytes = stream.next().await.unwrap().unwrap();
             let message = Message::parse_from_bytes(&bytes).unwrap();
@@ -262,7 +323,7 @@ mod tests {
             let Some(hbb_common::message_proto::misc::Union::ChatMessage(chat)) = misc.union else {
                 panic!("expected encrypted chat message");
             };
-            chat.text
+            (chat.text, meta)
         });
 
         let capture = captured_client_bytes.clone();
@@ -310,7 +371,9 @@ mod tests {
         stream.send(&message).await.unwrap();
         drop(stream);
 
-        assert_eq!(server_task.await.unwrap(), marker);
+        let (server_marker, meta) = server_task.await.unwrap();
+        assert_eq!(server_marker, marker);
+        assert_eq!(meta.client_capabilities, 0);
         proxy_task.await.unwrap().unwrap();
         let captured = captured_client_bytes.lock().unwrap();
         assert!(!captured
