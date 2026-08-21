@@ -235,6 +235,48 @@ mod tests {
         assert!(require_protocol_version(PROTOCOL_VERSION + 1, "server").is_err());
     }
 
+    #[test]
+    fn enterprise_capability_bits_are_distinct() {
+        assert_ne!(
+            crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_V1,
+            crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_REQUESTED
+        );
+        assert_eq!(
+            crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_V1
+                & crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_REQUESTED,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_handshake_reports_client_capabilities() {
+        let _ = hbb_common::sodiumoxide::init();
+        let (device_public_key, device_secret_key) = sign::gen_keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capabilities = crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_V1
+            | crate::enterprise::protocol::LAN_CAP_ENTERPRISE_AUTH_REQUESTED;
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let local_addr = socket.local_addr().unwrap();
+            let mut stream = Stream::from(socket, local_addr);
+            server_handshake_with_identity(&mut stream, &device_secret_key, &device_public_key)
+                .await
+                .unwrap()
+        });
+
+        let socket = TcpStream::connect(addr).await.unwrap();
+        let local_addr = socket.local_addr().unwrap();
+        let mut stream = Stream::from(socket, local_addr);
+        client_handshake_with_capabilities(&mut stream, capabilities)
+            .await
+            .unwrap();
+
+        let meta = server_task.await.unwrap();
+        assert_eq!(meta.client_capabilities & capabilities, capabilities);
+    }
+
     #[tokio::test]
     async fn loopback_handshake_encrypts_application_payload() {
         let _ = hbb_common::sodiumoxide::init();
